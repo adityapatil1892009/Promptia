@@ -1,0 +1,51 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="/static/css/style.css" rel="stylesheet">
+    <title>Promptia - Image Submission</title>
+</head>
+
+<body>
+    <div class="form-container">
+        <h2>Promptia</h2>
+        <p style="text-align:center;">
+            Image Recreation - Round 1
+        </p>
+
+
+<form id="submissionForm"
+      action="/sub_1"
+      method="POST"
+      enctype="multipart/form-data">
+
+    <label for="name">Enter Your Name</label>
+    <input type="text" id="name" name="name"
+           maxlength="100" required>
+
+    <label for="enr">Enter Enrollment No.</label>
+    <input type="text" id="enr" name="enr"
+           maxlength="50" required>
+
+    <label for="prompt">Master Prompt</label>
+    <textarea id="prompt" name="prompt"
+              maxlength="10000" required></textarea>
+
+    <label for="image">Generated Image</label>
+    <input type="file" id="image" name="image"
+           accept="image/png,image/jpeg,image/webp"
+           required>
+
+    <p class="note">
+        Upload the image generated using your master prompt.
+        Maximum size: 10 MB.
+    </p>
+
+    <button type="submit">Submit Entry</button>
+</form>
+
+    </div>
+</body>
+</html>
