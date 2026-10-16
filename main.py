@@ -7,6 +7,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.chrome.service import Service
 
 import os
 import uuid
@@ -14,7 +15,7 @@ import tempfile
 
 load_dotenv()
 
-app = Flask(__name__, template_folder=".")
+app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 supabase = create_client(
@@ -28,8 +29,10 @@ ALLOWED_TYPES = {
     "image/webp": ".webp"
 }
 
-REFERENCE_IMAGE = os.path.abspath(
-    os.path.join("static", "images", "img.jpeg")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+REFERENCE_IMAGE = os.path.join(
+    BASE_DIR, "static", "images", "img.jpeg"
 )
 
 COMPARISON_URL = (
@@ -47,16 +50,27 @@ PROMPT_RESULT_XPATH = (
 
 def create_browser():
     options = webdriver.ChromeOptions()
+
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1365,1000")
 
-    chrome_binary = os.environ.get("CHROME_BIN")
-    if chrome_binary:
-        options.binary_location = chrome_binary
+    chrome_binary = os.environ.get(
+        "CHROME_BIN", "/usr/bin/chromium"
+    )
+    driver_path = os.environ.get(
+        "CHROMEDRIVER_PATH", "/usr/bin/chromedriver"
+    )
 
-    return webdriver.Chrome(options=options)
+    options.binary_location = chrome_binary
+
+    service = Service(executable_path=driver_path)
+
+    return webdriver.Chrome(
+        service=service,
+        options=options
+    )
 
 
 def compare_images(temp_path):
@@ -179,13 +193,13 @@ def evaluate_prompt(prompt):
 
 @app.route("/")
 def index():
-    return render_template("templates/index.html")
+    return render_template("index.html")
 
 
 @app.route("/sub_1", methods=["GET", "POST"])
 def sub_1():
     if request.method == "GET":
-        return render_template("templates/index.html")
+        return render_template("index.html")
 
     name = request.form.get("name", "").strip()
     enr = request.form.get("enr", "").strip()
