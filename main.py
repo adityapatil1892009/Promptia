@@ -3,7 +3,7 @@ import os
 import uuid
 import tempfile
 import logging
-
+import threading
 from flask import Flask, render_template, render_template_string, request
 from dotenv import load_dotenv
 from supabase import create_client
@@ -242,6 +242,91 @@ def compare_images(uploaded_image_path):
         close_browser(driver)
 
 
+def process_submission(submission_id, image_path, image_bytes, content_type):
+    temporary_path = None
+
+    try:
+        extension = os.path.splitext(image_path)[1]
+
+        # Upload the image to Supabase Storage in the background.
+        app.logger.info(
+            "BACKGROUND: Uploading image for submission %s",
+            submission_id,
+        )
+
+        supabase.storage.from_(BUCKET_NAME).upload(
+            image_path,
+            image_bytes,
+            file_options={
+                "content-type": content_type,
+                "upsert": "false",
+            },
+        )
+
+        # Create a temporary file for Selenium.
+        with tempfile.NamedTemporaryFile(
+            suffix=extension,
+            delete=False,
+        ) as temporary_file:
+            temporary_file.write(image_bytes)
+            temporary_path = temporary_file.name
+
+        # Run the image comparison in the background.
+        app.logger.info(
+            "BACKGROUND: Comparing image for submission %s",
+            submission_id,
+        )
+
+        result = compare_images(temporary_path)
+
+        # Update the existing database row with the final result.
+        response = (
+            supabase.table("promptia_submissions")
+            .update({"similarity_result": result})
+            .eq("id", submission_id)
+            .execute()
+        )
+
+        if not response.data:
+            app.logger.error(
+                "BACKGROUND: No database row updated for submission %s",
+                submission_id,
+            )
+            return
+
+        app.logger.info(
+            "BACKGROUND: Result saved for submission %s: %s",
+            submission_id,
+            result,
+        )
+
+    except Exception:
+        app.logger.exception(
+            "BACKGROUND: Processing failed for submission %s",
+            submission_id,
+        )
+
+        # Record the failure rather than leaving Pending forever.
+        try:
+            supabase.table("promptia_submissions").update(
+                {"similarity_result": MANUAL_IMAGE}
+            ).eq("id", submission_id).execute()
+
+        except Exception:
+            app.logger.exception(
+                "BACKGROUND: Could not save failure status for %s",
+                submission_id,
+            )
+
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                app.logger.exception(
+                    "BACKGROUND: Could not remove temporary image."
+                )
+
 # --------------------------------------------------
 # HOME PAGE
 # --------------------------------------------------
@@ -255,13 +340,12 @@ def home():
 # SUBMISSION
 # --------------------------------------------------
 
+
 @app.route("/sub_1", methods=["GET", "POST"])
 def submit():
 
     if request.method == "GET":
         return render_template("index.html")
-
-    temporary_path = None
 
     try:
         name = request.form.get("name", "").strip()
@@ -269,12 +353,10 @@ def submit():
         prompt = request.form.get("prompt", "").strip()
         image_file = request.files.get("image")
 
-        # Validate form fields.
         if not name or not enr or not prompt:
             return message_page(
                 "Missing information",
-                "Please fill in your name, enrollment number, "
-                "and master prompt.",
+                "Please fill in all required fields.",
                 400,
             )
 
@@ -288,7 +370,7 @@ def submit():
         if not image_file or not image_file.filename:
             return message_page(
                 "Image required",
-                "Please select an image to submit.",
+                "Please select an image.",
                 400,
             )
 
@@ -320,125 +402,66 @@ def submit():
             )
 
         extension = ALLOWED_TYPES[content_type]
-
-        with tempfile.NamedTemporaryFile(
-            suffix=extension,
-            delete=False,
-        ) as temporary_file:
-            temporary_file.write(image_bytes)
-            temporary_path = temporary_file.name
-
         image_path = (
             f"submissions/{uuid.uuid4().hex}{extension}"
         )
 
-        # Step 1: Upload the image to Supabase Storage.
-        storage_uploaded = False
+        # Save the submission immediately with a pending result.
+        response = (
+            supabase.table("promptia_submissions")
+            .insert({
+                "name": name,
+                "enr": enr,
+                "prompt": prompt,
+                "image_path": image_path,
+                "similarity_result": "Pending",
+            })
+            .execute()
+        )
 
-        try:
-            app.logger.info("STORAGE: Uploading submitted image.")
+        if not response.data:
+            raise RuntimeError(
+                "Supabase did not confirm the submission."
+            )
 
-            supabase.storage.from_(BUCKET_NAME).upload(
+        submission_id = response.data[0]["id"]
+
+        app.logger.info(
+            "SUBMISSION: Saved ID %s. Starting background processing.",
+            submission_id,
+        )
+
+        # Start storage upload and comparison without blocking
+        # the participant's response page.
+        worker = threading.Thread(
+            target=process_submission,
+            args=(
+                submission_id,
                 image_path,
                 image_bytes,
-                file_options={
-                    "content-type": content_type,
-                    "upsert": "false",
-                },
-            )
-
-            storage_uploaded = True
-            app.logger.info("STORAGE: Image upload completed.")
-
-        except Exception:
-            app.logger.exception("STORAGE: Image upload failed.")
-
-        # Step 2: Wait for the image checker to return its result.
-        # This call must finish before the database insert below.
-        app.logger.info(
-            "SUBMISSION: Waiting for image comparison to finish."
+                content_type,
+            ),
+            daemon=True,
         )
-
-        similarity_result = compare_images(temporary_path)
-
-        # Step 3: Save the submission only after comparison finishes.
-        # The master prompt is stored but is not evaluated.
-        app.logger.info(
-            "DATABASE: Saving submission and final comparison result."
-        )
-
-        insert_data = {
-            "name": name,
-            "enr": enr,
-            "prompt": prompt,
-            "image_path": image_path,
-            "similarity_result": similarity_result,
-        }
-
-        if not storage_uploaded:
-            app.logger.warning(
-                "DATABASE: Storage upload failed; the image_path "
-                "may not refer to an uploaded object."
-            )
-
-        try:
-            response = (
-                supabase.table("promptia_submissions")
-                .insert(insert_data)
-                .execute()
-            )
-
-            app.logger.info("DATABASE RESPONSE: %s", response.data)
-
-            if not response.data:
-                raise RuntimeError(
-                    "Supabase returned no inserted row."
-                )
-
-        except Exception as db_error:
-            app.logger.exception(
-                "DATABASE INSERT FAILED: %s",
-                str(db_error),
-            )
-            raise
-
-        app.logger.info(
-            "DATABASE: Submission and result saved successfully."
-        )
-
-        # Step 4: Only now return the final page to the participant.
-        if similarity_result.startswith("MANUAL REVIEW REQUIRED"):
-            return message_page(
-                "Submission received",
-                "Your submission has been saved. Automatic image "
-                "comparison could not be completed, so the image "
-                "requires manual review. Please do not submit again.",
-            )
+        worker.start()
 
         return message_page(
-            "Submission successful",
-            "Your image comparison is complete and your submission "
-            "and result have been saved. Thank you for participating!",
+            "Submission received",
+            "Your entry has been saved successfully. Image "
+            "comparison is now running in the background. "
+            "You do not need to submit again.",
         )
 
     except Exception:
-        app.logger.exception("SUBMISSION: Processing failed.")
+        app.logger.exception("SUBMISSION: Could not save entry.")
 
         return message_page(
-            "Submission processing failed",
-            "We could not finish saving your submission. Please "
-            "contact the organizers before submitting again.",
+            "Submission failed",
+            "We could not save your entry. Please contact the "
+            "organizers before trying again.",
             500,
         )
 
-    finally:
-        if temporary_path and os.path.exists(temporary_path):
-            try:
-                os.remove(temporary_path)
-            except OSError:
-                app.logger.exception(
-                    "Could not remove temporary image."
-                )
 
 
 # --------------------------------------------------
