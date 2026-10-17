@@ -381,16 +381,26 @@ def submit():
                 "may not refer to an uploaded object."
             )
 
-        response = (
-            supabase.table("promptia_submissions")
-            .insert(insert_data)
-            .execute()
-        )
-
-        if not response.data:
-            raise RuntimeError(
-                "Supabase did not confirm the submission insert."
+        try:
+            response = (
+                supabase.table("promptia_submissions")
+                .insert(insert_data)
+                .execute()
             )
+
+            app.logger.info("DATABASE RESPONSE: %s", response.data)
+
+            if not response.data:
+                raise RuntimeError(
+                    "Supabase returned no inserted row."
+                )
+
+        except Exception as db_error:
+            app.logger.exception(
+                "DATABASE INSERT FAILED: %s",
+                str(db_error),
+            )
+            raise
 
         app.logger.info(
             "DATABASE: Submission and result saved successfully."
