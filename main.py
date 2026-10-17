@@ -1,4 +1,9 @@
 
+import os
+import time
+import uuid
+import tempfile
+
 from flask import Flask, render_template, request
 from dotenv import load_dotenv
 from supabase import create_client
@@ -10,10 +15,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
-import os
-import uuid
-import tempfile
-import time
 
 load_dotenv()
 
@@ -42,14 +43,19 @@ COMPARISON_URL = (
 )
 
 PROMPT_EVALUATOR_URL = (
-    "https://sureprompts.com/prompt-score"
+    "https://www.spaceprompts.com/ai-tools/prompt-evaluator"
 )
 
-PROMPT_INPUT_ID = "prompt-input"
+PROMPT_INPUT_CLASS = "prompt-evaluator_promptTextarea__BwMQ0"
+PROMPT_BUTTON_CLASS = "prompt-evaluator_evaluateButton__5l8es"
 
 PROMPT_RESULT_XPATH = (
-    '//*[@id="main-content"]/div/div/div/div[2]/div[1]/div/div/span[1]'
+    "/html/body/main/section/div/div[2]/div/div[2]/"
+    "div/div[1]/div[1]/span[1]"
 )
+
+MANUAL_IMAGE = "MANUAL REVIEW REQUIRED: Image comparison failed."
+MANUAL_PROMPT = "MANUAL REVIEW REQUIRED: Prompt evaluation failed."
 
 
 def create_browser():
@@ -61,6 +67,7 @@ def create_browser():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1365,1000")
 
+    # Use the browser and driver installed on the hosting server.
     chrome_binary = os.environ.get("CHROME_BIN")
     driver_path = os.environ.get("CHROMEDRIVER_PATH")
 
@@ -76,22 +83,30 @@ def create_browser():
     else:
         driver = webdriver.Chrome(options=options)
 
-    driver.set_page_load_timeout(45)
+    driver.set_page_load_timeout(25)
     return driver
 
 
-def compare_images(temp_path):
-    if not os.path.isfile(REFERENCE_IMAGE):
-        app.logger.error(
-            "Reference image missing: %s", REFERENCE_IMAGE
-        )
-        return "Reference image not found"
+def close_browser(driver):
+    if driver:
+        try:
+            driver.quit()
+        except Exception:
+            app.logger.exception("Could not close browser")
 
+
+def compare_images(temp_path):
     driver = None
 
     try:
+        if not os.path.isfile(REFERENCE_IMAGE):
+            app.logger.error(
+                "Reference image missing: %s", REFERENCE_IMAGE
+            )
+            return "MANUAL REVIEW REQUIRED: Reference image missing."
+
         driver = create_browser()
-        wait = WebDriverWait(driver, 30)
+        wait = WebDriverWait(driver, 20)
 
         driver.get(COMPARISON_URL)
 
@@ -132,23 +147,17 @@ def compare_images(temp_path):
         result = result_element.text.strip()
 
         if not result:
-            return "Comparison failed: empty result"
+            raise ValueError("Image comparison returned empty text")
 
         app.logger.info("Image comparison completed")
         return result
 
     except Exception:
         app.logger.exception("Image comparison failed")
-        return "Comparison failed"
+        return MANUAL_IMAGE
 
     finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                app.logger.exception(
-                    "Could not close image comparison browser"
-                )
+        close_browser(driver)
 
 
 def evaluate_prompt(prompt):
@@ -156,29 +165,41 @@ def evaluate_prompt(prompt):
 
     try:
         driver = create_browser()
-        wait = WebDriverWait(driver, 40)
+        wait = WebDriverWait(driver, 25)
 
         driver.get(PROMPT_EVALUATOR_URL)
 
+        # Locate the textarea using the class you provided.
         prompt_box = wait.until(
             EC.visibility_of_element_located(
-                (By.ID, PROMPT_INPUT_ID)
+                (By.CLASS_NAME, PROMPT_INPUT_CLASS)
             )
         )
 
-        result_element = wait.until(
-            EC.presence_of_element_located(
-                (By.XPATH, PROMPT_RESULT_XPATH)
+        # Locate the evaluator button using its supplied class.
+        evaluate_button = wait.until(
+            EC.element_to_be_clickable(
+                (By.CLASS_NAME, PROMPT_BUTTON_CLASS)
             )
         )
 
-        previous_result = result_element.text.strip()
+        # Record any existing result so that an old result is not
+        # mistaken for the result of this participant's prompt.
+        old_elements = driver.find_elements(
+            By.XPATH, PROMPT_RESULT_XPATH
+        )
+
+        old_result = (
+            old_elements[0].text.strip()
+            if old_elements else ""
+        )
 
         prompt_box.clear()
         prompt_box.send_keys(prompt)
 
-        # Wait for a new, non-empty result to appear and
-        # remain stable for 2 seconds.
+        # Click only the actual Evaluate button. Never click ads.
+        evaluate_button.click()
+
         state = {
             "text": "",
             "since": None
@@ -196,11 +217,12 @@ def evaluate_prompt(prompt):
 
             current = elements[0].text.strip()
 
-            if not current or current == previous_result:
+            if not current or current == old_result:
                 state["text"] = ""
                 state["since"] = None
                 return False
 
+            # Wait until the result stops changing before saving it.
             if current != state["text"]:
                 state["text"] = current
                 state["since"] = time.monotonic()
@@ -208,7 +230,7 @@ def evaluate_prompt(prompt):
 
             return (
                 state["since"] is not None
-                and time.monotonic() - state["since"] >= 2
+                and time.monotonic() - state["since"] >= 1.5
             )
 
         wait.until(result_is_ready)
@@ -216,32 +238,34 @@ def evaluate_prompt(prompt):
         result = state["text"].strip()
 
         if not result:
-            return "Prompt evaluation failed: empty result"
+            raise ValueError("Prompt evaluator returned empty text")
 
         app.logger.info("Prompt evaluation completed")
         return result
 
     except TimeoutException:
         app.logger.warning(
-            "Prompt evaluation timed out or result did not update"
+            "Prompt evaluation timed out or no new result appeared"
         )
-        return "Prompt evaluation timed out"
+        return "MANUAL REVIEW REQUIRED: Prompt evaluator timed out."
 
     except Exception:
         app.logger.exception("Prompt evaluation failed")
-        return "Prompt evaluation failed"
+        return MANUAL_PROMPT
 
     finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                app.logger.exception(
-                    "Could not close prompt evaluation browser"
-                )
+        close_browser(driver)
 
 
 def save_result(submission_id, column, result):
+    # Only allow updates to the two intended result columns.
+    if column not in {
+        "similarity_result",
+        "prompt_evaluation_result"
+    }:
+        app.logger.error("Invalid result column: %s", column)
+        return False
+
     try:
         supabase.table("promptia_submissions").update({
             column: result
@@ -274,9 +298,9 @@ def sub_1():
     name = request.form.get("name", "").strip()
     enr = request.form.get("enr", "").strip()
     prompt = request.form.get("prompt", "").strip()
-    image = request.files.get("image")
+    image_file = request.files.get("image")
 
-    if not name or not enr or not prompt or not image:
+    if not name or not enr or not prompt or not image_file:
         return "Please complete all fields.", 400
 
     if (
@@ -286,38 +310,31 @@ def sub_1():
     ):
         return "One or more fields are too long.", 400
 
-    extension = ALLOWED_TYPES.get(image.mimetype)
+    extension = ALLOWED_TYPES.get(image_file.mimetype)
 
     if not extension:
         return "Upload a PNG, JPG or WebP image.", 400
 
-    image_data = image.read()
+    image_data = image_file.read()
 
     if not image_data or len(image_data) > 10 * 1024 * 1024:
         return "Image must be between 1 byte and 10 MB.", 400
 
     image_path = f"{uuid.uuid4().hex}{extension}"
     temp_path = None
+    submission_id = None
 
     try:
-        # Create a temporary image for Selenium.
+        # Create the temporary image used by ImgOnline.
         with tempfile.NamedTemporaryFile(
-            suffix=extension, delete=False
+            suffix=extension,
+            delete=False
         ) as temp_file:
             temp_file.write(image_data)
             temp_path = temp_file.name
 
-        # 1. Upload image to Supabase Storage.
-        supabase.storage.from_("images").upload(
-            image_path,
-            image_data,
-            {
-                "content-type": image.mimetype,
-                "upsert": "false"
-            }
-        )
-
-        # 2. Save submission before running evaluations.
+        # STEP 1: SAVE THE SUBMISSION FIRST.
+        # Evaluator failures must not prevent this database insert.
         inserted = supabase.table(
             "promptia_submissions"
         ).insert({
@@ -325,66 +342,116 @@ def sub_1():
             "enr": enr,
             "prompt": prompt,
             "image_path": image_path,
-            "similarity_result": "Processing",
-            "prompt_evaluation_result": "Processing"
+            "similarity_result": "Pending - manual review if not updated",
+            "prompt_evaluation_result": (
+                "Pending - manual review if not updated"
+            )
         }).execute()
 
         if not inserted.data:
-            raise RuntimeError(
-                "Submission insert returned no data"
-            )
+            raise RuntimeError("Database insert returned no data")
 
         submission_id = inserted.data[0]["id"]
 
-        # 3. Run image comparison and save immediately.
-        similarity_result = compare_images(temp_path)
+        app.logger.info(
+            "Submission saved before evaluation: %s",
+            submission_id
+        )
 
-        image_saved = save_result(
+        # STEP 2: TRY TO STORE THE IMAGE.
+        # If storage fails, the database submission still exists.
+        storage_ok = False
+
+        try:
+            supabase.storage.from_("images").upload(
+                image_path,
+                image_data,
+                {
+                    "content-type": image_file.mimetype,
+                    "upsert": "false"
+                }
+            )
+            storage_ok = True
+
+        except Exception:
+            app.logger.exception(
+                "Image storage upload failed for submission %s",
+                submission_id
+            )
+
+        # STEP 3: RUN IMAGE COMPARISON INDEPENDENTLY.
+        # A failed comparison becomes a manual-review status.
+        if storage_ok:
+            similarity_result = compare_images(temp_path)
+        else:
+            similarity_result = (
+                "MANUAL REVIEW REQUIRED: Image storage upload failed."
+            )
+
+        save_result(
             submission_id,
             "similarity_result",
             similarity_result
         )
 
-        # 4. Run prompt evaluation independently.
+        # STEP 4: RUN PROMPT EVALUATION REGARDLESS OF IMAGE RESULT.
         prompt_result = evaluate_prompt(prompt)
 
-        prompt_saved = save_result(
+        save_result(
             submission_id,
             "prompt_evaluation_result",
             prompt_result
         )
 
-        # The submission remains saved even if a result update fails.
-        if not image_saved or not prompt_saved:
-            app.logger.error(
-                "One or more results were not saved for submission %s",
-                submission_id
-            )
-
+        # STEP 5: DO NOT REJECT THE SUBMISSION BECAUSE AN EVALUATOR
+        # FAILED. The submission was saved at STEP 1.
         return """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1.0">
+            <title>Promptia - Submission Received</title>
+        </head>
+        <body>
+            <h2>Submission received!</h2>
+            <p>Your submission has been recorded.</p>
+            <p>If an automatic evaluation fails, it will need
+               manual review by the organizers.</p>
+            <a href="/">Back to form</a>
+        </body>
+        </html>
+        """
+
+    except Exception:
+        app.logger.exception("Promptia submission failed")
+
+        if submission_id is not None:
+            # The row was already created. Do not tell the participant
+            # that it was never saved merely because later work failed.
+            return """
             <!DOCTYPE html>
             <html lang="en">
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport"
                       content="width=device-width, initial-scale=1.0">
-                <title>Promptia - Submission Received</title>
+                <title>Promptia - Submission Recorded</title>
             </head>
             <body>
-                <h2>Submission received!</h2>
-                <p>Your prompt and image have been saved.</p>
-                <p>Evaluation results have been processed.
-                   If an evaluator failed, its status is recorded.</p>
+                <h2>Your submission has been recorded.</h2>
+                <p>Automatic processing was interrupted.
+                   The organizers may need to review it manually.</p>
                 <a href="/">Back to form</a>
             </body>
             </html>
-        """
+            """
 
-    except Exception:
-        app.logger.exception("Promptia submission failed")
+        # No database row was confirmed, so don't falsely claim success.
         return (
-            "The submission could not be completed. "
-            "Please contact the organizer.",
+            "We could not confirm that your submission was saved. "
+            "Please contact the organizers before submitting again.",
             500
         )
 
