@@ -83,7 +83,8 @@ def create_browser():
     else:
         driver = webdriver.Chrome(options=options)
 
-    driver.set_page_load_timeout(25)
+    driver.set_page_load_timeout(60)
+    driver.set_script_timeout(60)
     return driver
 
 
@@ -160,101 +161,88 @@ def compare_images(temp_path):
         close_browser(driver)
 
 
+
+
 def evaluate_prompt(prompt):
     driver = None
 
     try:
+        app.logger.info("PROMPT: Starting evaluation")
+
         driver = create_browser()
-        wait = WebDriverWait(driver, 25)
+        wait = WebDriverWait(driver, 30)
 
         driver.get(PROMPT_EVALUATOR_URL)
 
-        # Locate the textarea using the class you provided.
+        # Wait for the prompt input, not the Evaluate button.
         prompt_box = wait.until(
             EC.visibility_of_element_located(
                 (By.CLASS_NAME, PROMPT_INPUT_CLASS)
             )
         )
 
-        # Locate the evaluator button using its supplied class.
-        evaluate_button = wait.until(
-            EC.element_to_be_clickable(
-                (By.CLASS_NAME, PROMPT_BUTTON_CLASS)
-            )
-        )
-
-        # Record any existing result so that an old result is not
-        # mistaken for the result of this participant's prompt.
-        old_elements = driver.find_elements(
-            By.XPATH, PROMPT_RESULT_XPATH
-        )
-
-        old_result = (
-            old_elements[0].text.strip()
-            if old_elements else ""
-        )
-
+        # Paste the participant's prompt.
         prompt_box.clear()
         prompt_box.send_keys(prompt)
 
-        # Click only the actual Evaluate button. Never click ads.
-        evaluate_button.click()
+        app.logger.info("PROMPT: Prompt entered")
 
-        state = {
-            "text": "",
-            "since": None
-        }
+        # Find the button without waiting for it to become clickable.
+        button = driver.find_element(
+            By.CLASS_NAME,
+            PROMPT_BUTTON_CLASS
+        )
 
-        def result_is_ready(browser):
-            elements = browser.find_elements(
-                By.XPATH, PROMPT_RESULT_XPATH
+        # Click Evaluate immediately.
+        driver.execute_script("arguments[0].click();", button)
+
+        app.logger.info("PROMPT: Evaluate clicked; waiting 5 seconds")
+
+        # Allow the evaluator to generate its result.
+        time.sleep(5)
+
+        # Read the result.
+        result_element = wait.until(
+            EC.visibility_of_element_located(
+                (By.XPATH, PROMPT_RESULT_XPATH)
             )
+        )
 
-            if not elements:
-                state["text"] = ""
-                state["since"] = None
-                return False
-
-            current = elements[0].text.strip()
-
-            if not current or current == old_result:
-                state["text"] = ""
-                state["since"] = None
-                return False
-
-            # Wait until the result stops changing before saving it.
-            if current != state["text"]:
-                state["text"] = current
-                state["since"] = time.monotonic()
-                return False
-
-            return (
-                state["since"] is not None
-                and time.monotonic() - state["since"] >= 1.5
-            )
-
-        wait.until(result_is_ready)
-
-        result = state["text"].strip()
+        result = result_element.text.strip()
 
         if not result:
-            raise ValueError("Prompt evaluator returned empty text")
+            app.logger.warning("PROMPT: Result was empty")
+            return (
+                "MANUAL REVIEW REQUIRED: Evaluator returned an empty result."
+            )
 
-        app.logger.info("Prompt evaluation completed")
+        app.logger.info("PROMPT: Evaluation result: %s", result[:300])
+
         return result
 
-    except TimeoutException:
-        app.logger.warning(
-            "Prompt evaluation timed out or no new result appeared"
+    except Exception as error:
+        app.logger.exception(
+            "PROMPT: Evaluation failed: %s",
+            type(error).__name__
         )
-        return "MANUAL REVIEW REQUIRED: Prompt evaluator timed out."
 
-    except Exception:
-        app.logger.exception("Prompt evaluation failed")
-        return MANUAL_PROMPT
+        if driver:
+            try:
+                driver.save_screenshot(
+                    os.path.join(BASE_DIR, "prompt_evaluator_failure.png")
+                )
+            except Exception:
+                app.logger.exception("PROMPT: Could not save screenshot")
+
+        return (
+            "MANUAL REVIEW REQUIRED: Prompt evaluation failed: "
+            + type(error).__name__
+        )
 
     finally:
         close_browser(driver)
+
+
 
 
 def save_result(submission_id, column, result):
