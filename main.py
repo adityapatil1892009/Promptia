@@ -4,12 +4,7 @@ import uuid
 import tempfile
 import logging
 
-from flask import (
-    Flask,
-    render_template,
-    render_template_string,
-    request,
-)
+from flask import Flask, render_template, render_template_string, request
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -42,10 +37,7 @@ SUPABASE_URL = "https://pcbegtsfvaizlhnhwexa.supabase.co"
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
 
 if not SUPABASE_SECRET_KEY:
-    raise RuntimeError(
-        "SUPABASE_SECRET_KEY is missing. "
-        "Add it to your .env file or deployment environment variables."
-    )
+    raise RuntimeError("SUPABASE_SECRET_KEY is missing.")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
@@ -71,7 +63,7 @@ MANUAL_IMAGE = (
 
 
 # --------------------------------------------------
-# HTML RESPONSE HELPERS
+# RESPONSE PAGE
 # --------------------------------------------------
 
 def message_page(title, message, status=200):
@@ -116,9 +108,7 @@ def message_page(title, message, status=200):
 def create_browser():
     options = webdriver.ChromeOptions()
 
-    # Do not wait for the entire page to finish loading.
-    # Explicit waits below will wait for the required elements.
-    options.page_load_strategy = "none"
+    options.page_load_strategy = "eager"
 
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -143,7 +133,7 @@ def create_browser():
         driver = webdriver.Chrome(options=options)
 
     driver.set_page_load_timeout(60)
-    driver.set_script_timeout(60)
+    driver.set_script_timeout(30)
 
     return driver
 
@@ -153,13 +143,11 @@ def close_browser(driver):
         try:
             driver.quit()
         except Exception:
-            app.logger.exception(
-                "Could not close the Selenium browser cleanly."
-            )
+            app.logger.exception("Could not close Selenium browser.")
 
 
 # --------------------------------------------------
-# IMAGE SIMILARITY COMPARISON
+# IMAGE COMPARISON
 # --------------------------------------------------
 
 def compare_images(uploaded_image_path):
@@ -167,25 +155,21 @@ def compare_images(uploaded_image_path):
 
     try:
         if not os.path.isfile(REFERENCE_IMAGE):
-            app.logger.error(
-                "Reference image not found: %s",
-                REFERENCE_IMAGE,
-            )
+            app.logger.error("Reference image is missing.")
             return MANUAL_IMAGE
 
         if not os.path.isfile(uploaded_image_path):
-            app.logger.error("Uploaded temporary image not found.")
+            app.logger.error("Uploaded temporary image is missing.")
             return MANUAL_IMAGE
 
-        app.logger.info("Starting image comparison.")
+        app.logger.info("IMAGE CHECK: Starting comparison.")
 
         driver = create_browser()
         wait = WebDriverWait(driver, 30)
 
-        app.logger.info("Opening ImgOnline.")
+        app.logger.info("IMAGE CHECK: Opening ImgOnline.")
         driver.get(COMPARISON_URL)
 
-        # Wait for both image upload fields.
         reference_input = wait.until(
             EC.presence_of_element_located(
                 (By.NAME, "uploadfile")
@@ -198,13 +182,12 @@ def compare_images(uploaded_image_path):
             )
         )
 
-        app.logger.info("Uploading the reference image.")
+        app.logger.info("IMAGE CHECK: Uploading reference image.")
         reference_input.send_keys(REFERENCE_IMAGE)
 
-        app.logger.info("Uploading the submitted image.")
+        app.logger.info("IMAGE CHECK: Uploading participant image.")
         uploaded_input.send_keys(uploaded_image_path)
 
-        # Locate the comparison submit button.
         submit_button = wait.until(
             EC.presence_of_element_located(
                 (
@@ -214,31 +197,24 @@ def compare_images(uploaded_image_path):
             )
         )
 
-        app.logger.info(
-            "Submitting images to ImgOnline."
-        )
+        app.logger.info("IMAGE CHECK: Submitting for comparison.")
 
-        # JavaScript click avoids some native Selenium click issues.
         driver.execute_script(
             "arguments[0].click();",
             submit_button,
         )
 
-        app.logger.info(
-            "Submit click triggered. Waiting for the result."
-        )
-
-        # Wait for ImgOnline's result page.
+        # Wait until the actual result page appears.
         wait.until(
             EC.url_contains("similarity-percent-result.php")
         )
 
         app.logger.info(
-            "ImgOnline result page detected."
+            "IMAGE CHECK: Result page detected; waiting for result."
         )
 
         result_element = wait.until(
-            EC.presence_of_element_located(
+            EC.visibility_of_element_located(
                 (By.XPATH, '//*[@id="content"]/span')
             )
         )
@@ -246,13 +222,11 @@ def compare_images(uploaded_image_path):
         result = result_element.text.strip()
 
         if not result:
-            app.logger.error(
-                "ImgOnline returned an empty similarity result."
-            )
+            app.logger.error("IMAGE CHECK: Result was empty.")
             return MANUAL_IMAGE
 
         app.logger.info(
-            "Image comparison completed: %s",
+            "IMAGE CHECK: Final result received: %s",
             result,
         )
 
@@ -260,47 +234,12 @@ def compare_images(uploaded_image_path):
 
     except Exception:
         app.logger.exception(
-            "Image comparison failed. Manual review is required."
+            "IMAGE CHECK: Failed; manual review is required."
         )
         return MANUAL_IMAGE
 
     finally:
         close_browser(driver)
-
-
-# --------------------------------------------------
-# SAVE SIMILARITY RESULT
-# --------------------------------------------------
-
-def save_result(submission_id, result):
-    try:
-        response = (
-            supabase.table("promptia_submissions")
-            .update({"similarity_result": result})
-            .eq("id", submission_id)
-            .execute()
-        )
-
-        if not response.data:
-            app.logger.warning(
-                "No submission row was updated for ID %s.",
-                submission_id,
-            )
-            return False
-
-        app.logger.info(
-            "Similarity result saved for submission ID %s.",
-            submission_id,
-        )
-
-        return True
-
-    except Exception:
-        app.logger.exception(
-            "Could not save the similarity result for ID %s.",
-            submission_id,
-        )
-        return False
 
 
 # --------------------------------------------------
@@ -313,7 +252,7 @@ def home():
 
 
 # --------------------------------------------------
-# SUBMISSION ROUTE
+# SUBMISSION
 # --------------------------------------------------
 
 @app.route("/sub_1", methods=["GET", "POST"])
@@ -322,18 +261,15 @@ def submit():
     if request.method == "GET":
         return render_template("index.html")
 
-    submission_id = None
     temporary_path = None
 
     try:
-        # Read form fields.
         name = request.form.get("name", "").strip()
         enr = request.form.get("enr", "").strip()
         prompt = request.form.get("prompt", "").strip()
-
         image_file = request.files.get("image")
 
-        # Validate required fields.
+        # Validate form fields.
         if not name or not enr or not prompt:
             return message_page(
                 "Missing information",
@@ -342,33 +278,17 @@ def submit():
                 400,
             )
 
-        if len(name) > 100:
+        if len(name) > 100 or len(enr) > 50 or len(prompt) > 10000:
             return message_page(
-                "Invalid name",
-                "Your name must be 100 characters or fewer.",
-                400,
-            )
-
-        if len(enr) > 50:
-            return message_page(
-                "Invalid enrollment number",
-                "Your enrollment number must be 50 characters "
-                "or fewer.",
-                400,
-            )
-
-        if len(prompt) > 10000:
-            return message_page(
-                "Prompt too long",
-                "Your master prompt must be 10,000 characters "
-                "or fewer.",
+                "Invalid information",
+                "Please check the length of your submitted fields.",
                 400,
             )
 
         if not image_file or not image_file.filename:
             return message_page(
                 "Image required",
-                "Please select the image you created.",
+                "Please select an image to submit.",
                 400,
             )
 
@@ -379,7 +299,7 @@ def submit():
         if content_type not in ALLOWED_TYPES:
             return message_page(
                 "Unsupported image",
-                "Please upload a PNG, JPEG, or WebP image.",
+                "Upload a PNG, JPEG, or WebP image.",
                 400,
             )
 
@@ -388,8 +308,7 @@ def submit():
         if not image_bytes:
             return message_page(
                 "Empty image",
-                "The selected image is empty. Please choose "
-                "another image.",
+                "The selected image is empty.",
                 400,
             )
 
@@ -402,7 +321,6 @@ def submit():
 
         extension = ALLOWED_TYPES[content_type]
 
-        # Prepare a temporary file for Selenium.
         with tempfile.NamedTemporaryFile(
             suffix=extension,
             delete=False,
@@ -410,49 +328,16 @@ def submit():
             temporary_file.write(image_bytes)
             temporary_path = temporary_file.name
 
-        # Generate a unique path for Supabase Storage.
         image_path = (
             f"submissions/{uuid.uuid4().hex}{extension}"
         )
 
-        # Save the submission first so that the participant's
-        # information is retained even if comparison fails.
-        app.logger.info(
-            "Saving submission for enrollment number: %s",
-            enr,
-        )
-
-        insert_response = (
-            supabase.table("promptia_submissions")
-            .insert({
-                "name": name,
-                "enr": enr,
-                "prompt": prompt,
-                "image_path": image_path,
-                "similarity_result": (
-                    "Pending - image comparison not completed"
-                ),
-            })
-            .execute()
-        )
-
-        if not insert_response.data:
-            raise RuntimeError(
-                "Supabase did not confirm that the submission "
-                "was saved."
-            )
-
-        submission_id = insert_response.data[0]["id"]
-
-        app.logger.info(
-            "Submission saved. ID: %s",
-            submission_id,
-        )
-
-        # Upload the submitted image to Supabase Storage.
-        upload_succeeded = False
+        # Step 1: Upload the image to Supabase Storage.
+        storage_uploaded = False
 
         try:
+            app.logger.info("STORAGE: Uploading submitted image.")
+
             supabase.storage.from_(BUCKET_NAME).upload(
                 image_path,
                 image_bytes,
@@ -462,109 +347,105 @@ def submit():
                 },
             )
 
-            upload_succeeded = True
-
-            app.logger.info(
-                "Image uploaded to Supabase Storage: %s",
-                image_path,
-            )
+            storage_uploaded = True
+            app.logger.info("STORAGE: Image upload completed.")
 
         except Exception:
-            app.logger.exception(
-                "Storage upload failed for submission ID %s.",
-                submission_id,
-            )
+            app.logger.exception("STORAGE: Image upload failed.")
 
-        # Compare images only if the image was stored successfully.
-        if upload_succeeded:
-            similarity_result = compare_images(
-                temporary_path
-            )
-        else:
-            similarity_result = (
-                "MANUAL REVIEW REQUIRED: "
-                "Image upload failed."
-            )
-
-        # Save the comparison result without evaluating the prompt.
-        result_saved = save_result(
-            submission_id,
-            similarity_result,
+        # Step 2: Wait for the image checker to return its result.
+        # This call must finish before the database insert below.
+        app.logger.info(
+            "SUBMISSION: Waiting for image comparison to finish."
         )
 
-        if not result_saved:
+        similarity_result = compare_images(temporary_path)
+
+        # Step 3: Save the submission only after comparison finishes.
+        # The master prompt is stored but is not evaluated.
+        app.logger.info(
+            "DATABASE: Saving submission and final comparison result."
+        )
+
+        insert_data = {
+            "name": name,
+            "enr": enr,
+            "prompt": prompt,
+            "image_path": image_path,
+            "similarity_result": similarity_result,
+        }
+
+        if not storage_uploaded:
             app.logger.warning(
-                "Submission %s is saved, but its final result "
-                "could not be updated.",
-                submission_id,
+                "DATABASE: Storage upload failed; the image_path "
+                "may not refer to an uploaded object."
             )
 
-        if similarity_result.startswith(
-            "MANUAL REVIEW REQUIRED"
-        ):
+        response = (
+            supabase.table("promptia_submissions")
+            .insert(insert_data)
+            .execute()
+        )
+
+        if not response.data:
+            raise RuntimeError(
+                "Supabase did not confirm the submission insert."
+            )
+
+        app.logger.info(
+            "DATABASE: Submission and result saved successfully."
+        )
+
+        # Step 4: Only now return the final page to the participant.
+        if similarity_result.startswith("MANUAL REVIEW REQUIRED"):
             return message_page(
                 "Submission received",
-                "Your submission has been recorded. Automatic "
-                "image comparison could not be completed, so "
-                "the image needs manual review. Please do not "
-                "submit it again.",
+                "Your submission has been saved. Automatic image "
+                "comparison could not be completed, so the image "
+                "requires manual review. Please do not submit again.",
             )
 
         return message_page(
             "Submission successful",
-            "Your submission has been recorded and the image "
-            "comparison has been completed. Thank you for "
-            "participating!",
+            "Your image comparison is complete and your submission "
+            "and result have been saved. Thank you for participating!",
         )
 
     except Exception:
-        app.logger.exception(
-            "Submission processing failed."
-        )
-
-        if submission_id is not None:
-            return message_page(
-                "Submission recorded",
-                "Your submission was saved, but processing did "
-                "not finish successfully. The organizers can "
-                "review it. Please do not submit it again.",
-                200,
-            )
+        app.logger.exception("SUBMISSION: Processing failed.")
 
         return message_page(
-            "Submission failed",
-            "We could not confirm that your submission was "
-            "saved. Please contact the organizers before "
-            "trying again.",
+            "Submission processing failed",
+            "We could not finish saving your submission. Please "
+            "contact the organizers before submitting again.",
             500,
         )
 
     finally:
-        # Remove the temporary local image.
         if temporary_path and os.path.exists(temporary_path):
             try:
                 os.remove(temporary_path)
             except OSError:
                 app.logger.exception(
-                    "Could not remove the temporary image."
+                    "Could not remove temporary image."
                 )
 
 
 # --------------------------------------------------
-# FILE TOO LARGE
+# FILE SIZE ERROR
 # --------------------------------------------------
 
 @app.errorhandler(413)
 def file_too_large(error):
     return message_page(
         "Image too large",
-        "The submitted request exceeds the 10 MB limit.",
+        "The request exceeds the 10 MB upload limit.",
         413,
     )
 
 
 # --------------------------------------------------
-# START APPLICATION
+# RUN APPLICATION
 # --------------------------------------------------
 
 if __name__ == "__main__":
